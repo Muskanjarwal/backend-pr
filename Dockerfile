@@ -15,6 +15,10 @@ COPY --from=build --chown=node:node /app/node_modules ./node_modules
 COPY --from=build --chown=node:node /app/dist ./dist
 COPY --chown=node:node migrations ./migrations
 COPY --chown=node:node package.json ./
+# The runtime only executes `node dist/...`. Drop the package managers bundled with the base image: they are never
+# used here and their vendored dependencies were the only findings in the image scan.
+RUN rm -rf /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/corepack \
+           /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack
 USER node
 EXPOSE 3000 9464
 HEALTHCHECK --interval=15s --timeout=3s --start-period=20s --retries=3 \
