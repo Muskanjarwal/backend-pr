@@ -137,7 +137,7 @@ Measured locally against **PostgreSQL 18** (not a mock), API + worker as built D
 * 40 concurrent clients, 15 s mixed workload: reads p95 **3.7 ms**, writes p95 **28.8 ms** (SLO 200 / 500 ms). Reads are mostly cache hits; writes were limited by available slots (79 samples).
 * `npm audit`: 0 vulnerabilities.
 
-Not verified here: container image build and Kubernetes manifests (no Docker/cluster available in the authoring environment — the YAML was syntax-checked and mirrors the tested process configuration), and the Mermaid diagrams were not rendered.
+The container image builds and passes the Trivy scan (CRITICAL/HIGH) in this repo's GitHub Actions pipeline. Not verified: the docker-compose stack and the Kubernetes manifests were never run (no cluster available; the YAML was syntax-checked and mirrors the tested process configuration), and the Mermaid diagrams were not rendered. The `deploy` job is opt-in (repository variable `DEPLOY_ENABLED=true`, secret `KUBECONFIG_B64`, `production` environment with reviewers) so it is skipped here.
 
 ## Limitations
 

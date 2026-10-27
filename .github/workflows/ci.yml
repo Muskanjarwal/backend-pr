@@ -91,11 +91,13 @@ jobs:
       - name: Push (immutable SHA tag)
         if: github.ref == 'refs/heads/main'
         run: |
-          docker tag amrutam/telemedicine-backend:${{ github.sha }} ghcr.io/${{ github.repository }}:${{ github.sha }}
-          docker push ghcr.io/${{ github.repository }}:${{ github.sha }}
+          docker tag amrutam/telemedicine-backend:${{ github.sha }} ghcr.io/${GITHUB_REPOSITORY,,}:${{ github.sha }}
+          docker push ghcr.io/${GITHUB_REPOSITORY,,}:${{ github.sha }}
 
   deploy:
-    if: github.ref == 'refs/heads/main'
+    # Opt-in: set repository variable DEPLOY_ENABLED=true and secret KUBECONFIG_B64, and configure the `production`
+    # environment with required reviewers. Without a cluster this job is skipped instead of failing every push.
+    if: github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true'
     needs: image
     runs-on: ubuntu-latest
     environment: production        # protected environment: manual approval + environment-scoped secrets
@@ -105,13 +107,13 @@ jobs:
         run: echo "${{ secrets.KUBECONFIG_B64 }}" | base64 -d > "$RUNNER_TEMP/kubeconfig" && echo "KUBECONFIG=$RUNNER_TEMP/kubeconfig" >> "$GITHUB_ENV"
       - name: Migrate (expand-only, runs before the rollout)
         run: |
-          IMAGE=ghcr.io/${{ github.repository }}:${{ github.sha }}
+          IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}:${{ github.sha }}
           kubectl -n amrutam delete job amrutam-migrate --ignore-not-found
           sed "s#ghcr.io/amrutam/telemedicine-backend:latest#${IMAGE}#" deploy/k8s/migrate-job.yaml | kubectl apply -f -
           kubectl -n amrutam wait --for=condition=complete job/amrutam-migrate --timeout=300s
       - name: Roll out
         run: |
-          IMAGE=ghcr.io/${{ github.repository }}:${{ github.sha }}
+          IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}:${{ github.sha }}
           kubectl apply -k deploy/k8s
           kubectl -n amrutam set image deployment/amrutam-api api=${IMAGE}
           kubectl -n amrutam set image deployment/amrutam-worker worker=${IMAGE}
