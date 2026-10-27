@@ -1,0 +1,30 @@
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: amrutam-config, namespace: amrutam }
+data:
+  NODE_ENV: production
+  LOG_LEVEL: info
+  TRUST_PROXY: "true"            # behind the ingress controller; rate limits then key on the real client IP
+  DATABASE_SSL: "true"
+  DB_POOL_MAX: "15"              # per pod. replicas × pool must stay under PgBouncer/DB max_connections
+  PORT: "3000"
+  METRICS_PORT: "9464"
+  WORKER_METRICS_PORT: "9465"
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector.observability:4318
+---
+# Secrets are NOT stored in git. In a real cluster this object is created by External Secrets / Secrets Store CSI
+# from AWS Secrets Manager / Vault. The keys below document what must exist.
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata: { name: amrutam-secrets, namespace: amrutam }
+spec:
+  refreshInterval: 1h
+  secretStoreRef: { name: aws-secrets-manager, kind: ClusterSecretStore }
+  target: { name: amrutam-secrets }
+  data:
+    - { secretKey: DATABASE_URL,           remoteRef: { key: amrutam/prod/database-url } }
+    - { secretKey: REDIS_URL,              remoteRef: { key: amrutam/prod/redis-url } }
+    - { secretKey: JWT_SECRET,             remoteRef: { key: amrutam/prod/jwt-secret } }
+    - { secretKey: DATA_ENCRYPTION_KEYS,   remoteRef: { key: amrutam/prod/data-encryption-keys } }
+    - { secretKey: AUDIT_HMAC_KEYS,        remoteRef: { key: amrutam/prod/audit-hmac-keys } }
+    - { secretKey: PAYMENT_WEBHOOK_SECRET, remoteRef: { key: amrutam/prod/payment-webhook-secret } }

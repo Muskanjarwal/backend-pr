@@ -1,0 +1,124 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env: { POSTGRES_USER: postgres, POSTGRES_PASSWORD: postgres, POSTGRES_DB: amrutam_test }
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 3s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+      - run: npm ci
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Build
+        run: npm run build
+      - name: Tests (real PostgreSQL; includes OpenAPI contract-drift check)
+        run: npm test
+        env:
+          TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/amrutam_test
+      - name: Tests (in-process Postgres, no services)
+        run: npm test
+
+  security:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+      - run: npm ci
+      - name: Dependency vulnerabilities (fails on high/critical in production deps)
+        run: npm run audit
+      - name: Secret scan
+        uses: gitleaks/gitleaks-action@v2
+        env: { GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}" }
+
+  codeql:
+    runs-on: ubuntu-latest
+    permissions: { contents: read, security-events: write }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: github/codeql-action/init@v3
+        with: { languages: javascript-typescript }
+      - uses: github/codeql-action/analyze@v3
+
+  image:
+    needs: [test, security]
+    runs-on: ubuntu-latest
+    permissions: { contents: read, packages: write, security-events: write }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: amrutam/telemedicine-backend:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Container vulnerability scan (OS + libraries)
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: amrutam/telemedicine-backend:${{ github.sha }}
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+      - name: Log in to GHCR
+        if: github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with: { registry: ghcr.io, username: "${{ github.actor }}", password: "${{ secrets.GITHUB_TOKEN }}" }
+      - name: Push (immutable SHA tag)
+        if: github.ref == 'refs/heads/main'
+        run: |
+          docker tag amrutam/telemedicine-backend:${{ github.sha }} ghcr.io/${{ github.repository }}:${{ github.sha }}
+          docker push ghcr.io/${{ github.repository }}:${{ github.sha }}
+
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    needs: image
+    runs-on: ubuntu-latest
+    environment: production        # protected environment: manual approval + environment-scoped secrets
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure kubectl
+        run: echo "${{ secrets.KUBECONFIG_B64 }}" | base64 -d > "$RUNNER_TEMP/kubeconfig" && echo "KUBECONFIG=$RUNNER_TEMP/kubeconfig" >> "$GITHUB_ENV"
+      - name: Migrate (expand-only, runs before the rollout)
+        run: |
+          IMAGE=ghcr.io/${{ github.repository }}:${{ github.sha }}
+          kubectl -n amrutam delete job amrutam-migrate --ignore-not-found
+          sed "s#ghcr.io/amrutam/telemedicine-backend:latest#${IMAGE}#" deploy/k8s/migrate-job.yaml | kubectl apply -f -
+          kubectl -n amrutam wait --for=condition=complete job/amrutam-migrate --timeout=300s
+      - name: Roll out
+        run: |
+          IMAGE=ghcr.io/${{ github.repository }}:${{ github.sha }}
+          kubectl apply -k deploy/k8s
+          kubectl -n amrutam set image deployment/amrutam-api api=${IMAGE}
+          kubectl -n amrutam set image deployment/amrutam-worker worker=${IMAGE}
+          kubectl -n amrutam rollout status deployment/amrutam-api --timeout=300s
+          kubectl -n amrutam rollout status deployment/amrutam-worker --timeout=300s
+      - name: Roll back on failure
+        if: failure()
+        run: |
+          kubectl -n amrutam rollout undo deployment/amrutam-api
+          kubectl -n amrutam rollout undo deployment/amrutam-worker

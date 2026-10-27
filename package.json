@@ -1,0 +1,56 @@
+{
+  "name": "amrutam-telemedicine-backend",
+  "version": "1.0.0",
+  "description": "Production-grade backend for Amrutam telemedicine",
+  "main": "dist/server.js",
+  "scripts": {
+    "dev": "tsx watch --import ./src/observability/tracing.ts src/server.ts",
+    "dev:worker": "tsx watch src/worker.ts",
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node --import ./dist/observability/tracing.js dist/server.js",
+    "start:worker": "node dist/worker.js",
+    "migrate": "tsx src/db/migrate-cli.ts",
+    "seed": "tsx src/cli/seed.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "audit": "npm audit --omit=dev --audit-level=high",
+    "demo": "tsx scripts/demo.ts",
+    "loadtest": "tsx scripts/loadtest.ts",
+    "reencrypt": "tsx src/cli/reencrypt.ts",
+    "seed:prod": "node dist/cli/seed.js"
+  },
+  "type": "module",
+  "dependencies": {
+    "@fastify/helmet": "^13.2.0",
+    "@fastify/rate-limit": "^11.2.1",
+    "@opentelemetry/api": "^1.10.0",
+    "@opentelemetry/exporter-trace-otlp-http": "^0.300.0",
+    "@opentelemetry/instrumentation-http": "^0.300.0",
+    "@opentelemetry/instrumentation-pg": "^0.77.0",
+    "@opentelemetry/resources": "^3.0.0",
+    "@opentelemetry/sdk-node": "^0.300.0",
+    "@opentelemetry/semantic-conventions": "^1.43.0",
+    "fastify": "^5.12.7",
+    "ioredis": "^6.0.0",
+    "jose": "^6.2.13",
+    "pg": "^8.23.1",
+    "pino": "^10.4.0",
+    "prom-client": "^15.1.3",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.11",
+    "@types/node": "^26.6.5",
+    "@types/pg": "^8.23.1",
+    "pino-pretty": "^13.2.0",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.5",
+    "yaml": "^2.9.1"
+  },
+  "private": true,
+  "engines": {
+    "node": ">=22"
+  }
+}

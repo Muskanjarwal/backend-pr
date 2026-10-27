@@ -1,0 +1,79 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: amrutam-api, namespace: amrutam, labels: { app: amrutam-api } }
+spec:
+  replicas: 4
+  strategy: { type: RollingUpdate, rollingUpdate: { maxUnavailable: 0, maxSurge: 25% } }  # zero-downtime deploys
+  selector: { matchLabels: { app: amrutam-api } }
+  template:
+    metadata:
+      labels: { app: amrutam-api }
+      annotations: { prometheus.io/scrape: "true", prometheus.io/port: "9464", prometheus.io/path: /metrics }
+    spec:
+      terminationGracePeriodSeconds: 30
+      automountServiceAccountToken: false
+      securityContext: { runAsNonRoot: true, runAsUser: 1000, seccompProfile: { type: RuntimeDefault } }
+      topologySpreadConstraints:           # spread across AZs so one zone loss doesn't take the API down
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector: { matchLabels: { app: amrutam-api } }
+      containers:
+        - name: api
+          image: ghcr.io/amrutam/telemedicine-backend:latest   # CI pins this to the immutable git SHA
+          ports: [{ name: http, containerPort: 3000 }, { name: metrics, containerPort: 9464 }]
+          envFrom:
+            - configMapRef: { name: amrutam-config }
+            - secretRef: { name: amrutam-secrets }
+          env: [{ name: OTEL_SERVICE_NAME, value: amrutam-api }]
+          resources: { requests: { cpu: 250m, memory: 256Mi }, limits: { memory: 512Mi } }
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } }
+          startupProbe:   { httpGet: { path: /healthz, port: http }, periodSeconds: 2, failureThreshold: 30 }
+          livenessProbe:  { httpGet: { path: /healthz, port: http }, periodSeconds: 10, failureThreshold: 3 }
+          readinessProbe: { httpGet: { path: /readyz,  port: http }, periodSeconds: 5,  failureThreshold: 2 }
+          lifecycle:
+            preStop: { exec: { command: ["sleep", "8"] } }   # let the LB deregister the pod before SIGTERM drains connections
+---
+apiVersion: v1
+kind: Service
+metadata: { name: amrutam-api, namespace: amrutam }
+spec:
+  selector: { app: amrutam-api }
+  ports: [{ name: http, port: 80, targetPort: http }]
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata: { name: amrutam-api, namespace: amrutam }
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: amrutam-api }
+  minReplicas: 4
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource: { name: cpu, target: { type: Utilization, averageUtilization: 60 } }
+  behavior:
+    scaleDown: { stabilizationWindowSeconds: 300 }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: { name: amrutam-api, namespace: amrutam }
+spec:
+  minAvailable: 3
+  selector: { matchLabels: { app: amrutam-api } }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: amrutam-api
+  namespace: amrutam
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: 512k
+    nginx.ingress.kubernetes.io/limit-rps: "50"       # coarse edge limit; fine-grained limits are in the app
+    cert-manager.io/cluster-issuer: letsencrypt
+spec:
+  ingressClassName: nginx
+  tls: [{ hosts: [api.amrutam.example], secretName: amrutam-api-tls }]
+  rules:
+    - host: api.amrutam.example
+      http:
+        paths: [{ path: /, pathType: Prefix, backend: { service: { name: amrutam-api, port: { name: http } } } }]

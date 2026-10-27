@@ -1,0 +1,33 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: amrutam-worker, namespace: amrutam, labels: { app: amrutam-worker } }
+spec:
+  replicas: 2            # any number is safe: jobs are claimed with FOR UPDATE SKIP LOCKED, crons dedupe via the jobs table
+  selector: { matchLabels: { app: amrutam-worker } }
+  template:
+    metadata:
+      labels: { app: amrutam-worker }
+      annotations: { prometheus.io/scrape: "true", prometheus.io/port: "9465", prometheus.io/path: /metrics }
+    spec:
+      terminationGracePeriodSeconds: 60   # finish the in-flight batch; unfinished jobs are re-leased after 60s anyway
+      automountServiceAccountToken: false
+      securityContext: { runAsNonRoot: true, runAsUser: 1000, seccompProfile: { type: RuntimeDefault } }
+      containers:
+        - name: worker
+          image: ghcr.io/amrutam/telemedicine-backend:latest
+          command: ["node", "dist/worker.js"]
+          envFrom:
+            - configMapRef: { name: amrutam-config }
+            - secretRef: { name: amrutam-secrets }
+          env: [{ name: DB_POOL_MAX, value: "8" }]
+          ports: [{ name: metrics, containerPort: 9465 }]
+          resources: { requests: { cpu: 100m, memory: 192Mi }, limits: { memory: 384Mi } }
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } }
+          livenessProbe: { httpGet: { path: /healthz, port: metrics }, periodSeconds: 15 }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: { name: amrutam-worker, namespace: amrutam }
+spec:
+  minAvailable: 1
+  selector: { matchLabels: { app: amrutam-worker } }

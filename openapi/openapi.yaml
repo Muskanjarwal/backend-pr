@@ -1,0 +1,1769 @@
+openapi: 3.1.0
+info:
+  title: Amrutam Telemedicine API
+  version: 1.0.0
+  description: |-
+    REST API for user lifecycle, doctor availability & booking, consultations, prescriptions, payments, audit and admin analytics.
+
+    **Conventions**
+    - Money is integer minor units (paise).
+    - Timestamps are ISO-8601 UTC.
+    - Unsafe writes that must not repeat (booking, prescriptions) require an `Idempotency-Key` header.
+    - Lists use opaque keyset cursors (`limit`, `cursor` -> `nextCursor`).
+    - Every response carries `x-request-id`; errors use the `Error` envelope.
+servers:
+  - url: http://localhost:3000
+tags:
+  - name: Auth
+  - name: Doctors
+  - name: Consultations
+  - name: Payments
+  - name: Admin
+  - name: Ops
+paths:
+  /healthz:
+    get:
+      summary: Liveness probe
+      tags:
+        - Ops
+      security: []
+      responses:
+        "200":
+          description: Process is up
+  /readyz:
+    get:
+      summary: Readiness probe (checks database)
+      tags:
+        - Ops
+      security: []
+      responses:
+        "200":
+          description: Ready
+        "503":
+          description: Dependency unavailable
+  /v1/auth/register:
+    post:
+      summary: Register a patient or doctor
+      tags:
+        - Auth
+      description: Doctors start `pending` and must be verified by an admin before they can publish availability. Admin accounts cannot be self-registered.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RegisterRequest"
+      security: []
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RegisteredUser"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+  /v1/auth/login:
+    post:
+      summary: Password login
+      tags:
+        - Auth
+      description: "Doctors and admins must use MFA: first login returns `mfa_setup_required`, later logins return `mfa_required`. Accounts lock after repeated failures."
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoginRequest"
+      security: []
+      responses:
+        "200":
+          description: Authenticated, or an MFA step is required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LoginResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "423":
+          $ref: "#/components/responses/Locked"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+  /v1/auth/mfa/verify:
+    post:
+      summary: Complete login with a TOTP code
+      tags:
+        - Auth
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - mfaToken
+                - code
+              properties:
+                mfaToken:
+                  type: string
+                code:
+                  type: string
+                  pattern: ^\d{6}$
+      security: []
+      responses:
+        "200":
+          description: Session
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tokens:
+                    $ref: "#/components/schemas/TokenPair"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "423":
+          $ref: "#/components/responses/Locked"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+  /v1/auth/mfa/setup:
+    post:
+      summary: Start MFA enrollment
+      tags:
+        - Auth
+      description: Accepts a normal access token or the `setupToken` from login.
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Shared secret and otpauth URI
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  secret:
+                    type: string
+                  otpauthUri:
+                    type: string
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+  /v1/auth/mfa/activate:
+    post:
+      summary: Confirm MFA enrollment
+      tags:
+        - Auth
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - code
+              properties:
+                code:
+                  type: string
+                  pattern: ^\d{6}$
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: MFA enabled; `tokens` present when called with a setup token
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  enabled:
+                    type: boolean
+                  tokens:
+                    $ref: "#/components/schemas/TokenPair"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+  /v1/auth/refresh:
+    post:
+      summary: Rotate refresh token
+      tags:
+        - Auth
+      description: Single-use. Re-presenting a used token revokes the whole session family.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - refreshToken
+              properties:
+                refreshToken:
+                  type: string
+      security: []
+      responses:
+        "200":
+          description: New token pair
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TokenPair"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+  /v1/auth/logout:
+    post:
+      summary: Revoke a refresh-token family
+      tags:
+        - Auth
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - refreshToken
+              properties:
+                refreshToken:
+                  type: string
+      security: []
+      responses:
+        "204":
+          description: Logged out
+        "400":
+          $ref: "#/components/responses/BadRequest"
+  /v1/me:
+    get:
+      summary: Current user
+      tags:
+        - Auth
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Profile
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Me"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /v1/doctors:
+    get:
+      summary: Search doctors
+      tags:
+        - Doctors
+      description: Only verified, active doctors. Results are cached for up to 30s.
+      parameters:
+        - name: specialty
+          in: query
+          schema:
+            type: string
+        - name: q
+          in: query
+          schema:
+            type: string
+          description: Name prefix
+        - name: language
+          in: query
+          schema:
+            type: string
+        - name: maxFeeMinor
+          in: query
+          schema:
+            type: integer
+        - name: availableFrom
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - name: availableTo
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: cursor
+          in: query
+          schema:
+            type: string
+          description: Opaque cursor from the previous page's nextCursor
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Page of doctors
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Doctor"
+                  nextCursor:
+                    type:
+                      - string
+                      - "null"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+  /v1/doctors/{id}:
+    get:
+      summary: Doctor profile
+      tags:
+        - Doctors
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Doctor
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Doctor"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /v1/doctors/me:
+    patch:
+      summary: Update own doctor profile
+      tags:
+        - Doctors
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                specialty:
+                  type: string
+                bio:
+                  type: string
+                languages:
+                  type: array
+                  items:
+                    type: string
+                feeMinor:
+                  type: integer
+                yearsExperience:
+                  type: integer
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Doctor"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+  /v1/doctors/me/slots:
+    post:
+      summary: Publish availability
+      tags:
+        - Doctors
+      description: Splits each window into fixed-length slots. Slots overlapping existing ones are skipped, so re-publishing is idempotent.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - windows
+                - slotMinutes
+              properties:
+                windows:
+                  type: array
+                  items:
+                    type: object
+                    required:
+                      - start
+                      - end
+                    properties:
+                      start:
+                        type: string
+                        format: date-time
+                      end:
+                        type: string
+                        format: date-time
+                slotMinutes:
+                  type: integer
+                  enum:
+                    - 15
+                    - 20
+                    - 30
+                    - 45
+                    - 60
+      security:
+        - bearerAuth: []
+      responses:
+        "201":
+          description: Slots generated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  requested:
+                    type: integer
+                  created:
+                    type: integer
+                  skippedOverlapping:
+                    type: integer
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+  /v1/doctors/me/slots/{slotId}:
+    delete:
+      summary: Withdraw an open slot
+      tags:
+        - Doctors
+      parameters:
+        - name: slotId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      security:
+        - bearerAuth: []
+      responses:
+        "204":
+          description: Withdrawn
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /v1/doctors/{id}/slots:
+    get:
+      summary: List bookable slots
+      tags:
+        - Doctors
+      description: Defaults to the next 14 days; max range 31 days.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: from
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          schema:
+            type: string
+            format: date-time
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Open slots
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Slot"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+  /v1/consultations:
+    post:
+      summary: "Book a slot (saga step 1: hold + create payment)"
+      tags:
+        - Consultations
+      description: "`Idempotency-Key` is required. The slot is held for `SLOT_HOLD_MINUTES`; the consultation is confirmed when the payment webhook arrives, otherwise the hold expires and the slot is released."
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - slotId
+              additionalProperties: false
+              properties:
+                slotId:
+                  type: string
+                  format: uuid
+                reason:
+                  type: string
+                  maxLength: 2000
+      security:
+        - bearerAuth: []
+      responses:
+        "201":
+          description: Held pending payment
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Consultation"
+          headers:
+            Idempotent-Replayed:
+              schema:
+                type: string
+              description: "`true` when this is a replay of an earlier identical request"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+    get:
+      summary: List my consultations
+      tags:
+        - Consultations
+      description: "Scoped to the caller: patients see theirs, doctors see theirs, admins see all."
+      parameters:
+        - name: status
+          in: query
+          schema:
+            $ref: "#/components/schemas/ConsultationStatus"
+        - name: from
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - name: doctorId
+          in: query
+          schema:
+            type: string
+            format: uuid
+          description: Admin only
+        - name: patientId
+          in: query
+          schema:
+            type: string
+            format: uuid
+          description: Admin only
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: cursor
+          in: query
+          schema:
+            type: string
+          description: Opaque cursor from the previous page's nextCursor
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Page
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Consultation"
+                  nextCursor:
+                    type:
+                      - string
+                      - "null"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+  /v1/consultations/{id}:
+    get:
+      summary: Get a consultation
+      tags:
+        - Consultations
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Consultation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Consultation"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /v1/consultations/{id}/cancel:
+    post:
+      summary: Cancel
+      tags:
+        - Consultations
+      description: Patients get a refund when cancelling at least `FREE_CANCELLATION_HOURS` ahead; doctor/admin cancellations always refund.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                reason:
+                  type: string
+                  maxLength: 500
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Cancelled (idempotent)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Consultation"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /v1/consultations/{id}/start:
+    post:
+      summary: Start (doctor)
+      tags:
+        - Consultations
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Consultation"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /v1/consultations/{id}/complete:
+    post:
+      summary: Complete (doctor)
+      tags:
+        - Consultations
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Consultation"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /v1/consultations/{id}/no-show:
+    post:
+      summary: Mark no-show (doctor)
+      tags:
+        - Consultations
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Consultation"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /v1/consultations/{id}/prescriptions:
+    post:
+      summary: Issue a prescription (doctor)
+      tags:
+        - Consultations
+      description: "`Idempotency-Key` required."
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PrescriptionRequest"
+      security:
+        - bearerAuth: []
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Prescription"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+    get:
+      summary: List prescriptions (patient or treating doctor)
+      tags:
+        - Consultations
+      description: Each read is written to the audit log. Admins cannot read clinical content.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Prescriptions
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Prescription"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /v1/payments/webhook:
+    post:
+      summary: PSP webhook (saga step 2)
+      tags:
+        - Payments
+      description: Authenticated by HMAC signature, not a bearer token. Returns 404 for unknown payments so the PSP retries.
+      parameters:
+        - name: X-Signature
+          in: header
+          required: true
+          schema:
+            type: string
+          description: '`t=<unix>,v1=<hex HMAC-SHA256 of "<t>.<raw body>">`; 5 minute tolerance'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - id
+                - type
+                - data
+              properties:
+                id:
+                  type: string
+                  description: Provider event id; processed at most once
+                type:
+                  type: string
+                  enum:
+                    - payment.succeeded
+                    - payment.failed
+                    - refund.succeeded
+                data:
+                  type: object
+                  required:
+                    - paymentId
+                  properties:
+                    paymentId:
+                      type: string
+      security: []
+      responses:
+        "200":
+          description: Processed or duplicate
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  duplicate:
+                    type: boolean
+                  outcome:
+                    type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /v1/payments/{id}:
+    get:
+      summary: Get payment
+      tags:
+        - Payments
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Payment
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Payment"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /v1/admin/doctors:
+    get:
+      summary: List doctors by verification status
+      tags:
+        - Admin
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum:
+              - pending
+              - verified
+              - rejected
+            default: pending
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Doctors
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Doctor"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+  /v1/admin/doctors/{id}/verification:
+    post:
+      summary: Verify or reject a doctor
+      tags:
+        - Admin
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - status
+              properties:
+                status:
+                  type: string
+                  enum:
+                    - verified
+                    - rejected
+      security:
+        - bearerAuth: []
+      responses:
+        "204":
+          description: Done
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /v1/admin/users/{id}/suspend:
+    post:
+      summary: Suspend a user
+      tags:
+        - Admin
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      security:
+        - bearerAuth: []
+      responses:
+        "204":
+          description: Done
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /v1/admin/users/{id}/reinstate:
+    post:
+      summary: Reinstate a user
+      tags:
+        - Admin
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      security:
+        - bearerAuth: []
+      responses:
+        "204":
+          description: Done
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /v1/admin/audit-logs:
+    get:
+      summary: Query the audit trail
+      tags:
+        - Admin
+      parameters:
+        - name: actorId
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: entityType
+          in: query
+          schema:
+            type: string
+        - name: entityId
+          in: query
+          schema:
+            type: string
+        - name: action
+          in: query
+          schema:
+            type: string
+        - name: from
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - name: verify
+          in: query
+          schema:
+            type: boolean
+            default: false
+          description: Recompute each row's HMAC and report `signatureValid`
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: cursor
+          in: query
+          schema:
+            type: string
+          description: Opaque cursor from the previous page's nextCursor
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Page
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/AuditEntry"
+                  nextCursor:
+                    type:
+                      - string
+                      - "null"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+  /v1/admin/analytics/summary:
+    get:
+      summary: Daily consultations & revenue by specialty
+      tags:
+        - Admin
+      description: Served from the `daily_stats` rollup table (refreshed every 5 minutes by the worker).
+      parameters:
+        - name: from
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date-time
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Rollup
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AnalyticsSummary"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+  /v1/admin/analytics/doctor-utilization:
+    get:
+      summary: Doctor slot utilization
+      tags:
+        - Admin
+      parameters:
+        - name: from
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date-time
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Utilization
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        doctorId:
+                          type: string
+                        fullName:
+                          type: string
+                        specialty:
+                          type: string
+                        bookedSlots:
+                          type: integer
+                        totalSlots:
+                          type: integer
+                        utilization:
+                          type: number
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+  /v1/admin/analytics/refresh:
+    post:
+      summary: Queue an analytics refresh
+      tags:
+        - Admin
+      security:
+        - bearerAuth: []
+      responses:
+        "202":
+          description: Queued
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema:
+        type: string
+        minLength: 8
+        maxLength: 128
+      description: Client-generated unique key (UUID recommended). Retrying with the same key and body returns the original response; a different body is rejected with 422.
+  responses:
+    BadRequest:
+      description: Validation failed
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Unauthorized:
+      description: Missing/invalid/expired credentials
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Forbidden:
+      description: Authenticated but not permitted
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    NotFound:
+      description: Not found (also returned for resources the caller may not know exist)
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Conflict:
+      description: State conflict (e.g. SLOT_UNAVAILABLE, INVALID_STATE)
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Unprocessable:
+      description: Idempotency-Key reused with a different request
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    RateLimited:
+      description: Rate limit exceeded; see Retry-After
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Locked:
+      description: Account temporarily locked
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+  schemas:
+    ConsultationStatus:
+      type: string
+      enum:
+        - pending_payment
+        - confirmed
+        - in_progress
+        - completed
+        - cancelled
+        - expired
+        - no_show
+    Error:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: object
+          required:
+            - code
+            - message
+          properties:
+            code:
+              type: string
+              example: SLOT_UNAVAILABLE
+            message:
+              type: string
+            details: {}
+            requestId:
+              type: string
+    TokenPair:
+      type: object
+      properties:
+        accessToken:
+          type: string
+        refreshToken:
+          type: string
+        tokenType:
+          type: string
+          enum:
+            - Bearer
+        expiresIn:
+          type: integer
+    RegisteredUser:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        email:
+          type: string
+        role:
+          type: string
+    RegisterRequest:
+      type: object
+      required:
+        - email
+        - password
+        - fullName
+        - role
+      additionalProperties: false
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+          minLength: 12
+          maxLength: 128
+        fullName:
+          type: string
+        phone:
+          type: string
+        role:
+          type: string
+          enum:
+            - patient
+            - doctor
+        doctor:
+          type: object
+          required:
+            - specialty
+            - registrationNumber
+            - yearsExperience
+            - feeMinor
+          properties:
+            specialty:
+              type: string
+            registrationNumber:
+              type: string
+            yearsExperience:
+              type: integer
+            languages:
+              type: array
+              items:
+                type: string
+            bio:
+              type: string
+            feeMinor:
+              type: integer
+              description: Consultation fee in minor units (paise)
+    LoginRequest:
+      type: object
+      required:
+        - email
+        - password
+      properties:
+        email:
+          type: string
+        password:
+          type: string
+    LoginResponse:
+      oneOf:
+        - type: object
+          properties:
+            status:
+              const: authenticated
+            tokens:
+              $ref: "#/components/schemas/TokenPair"
+        - type: object
+          properties:
+            status:
+              const: mfa_required
+            mfaToken:
+              type: string
+        - type: object
+          properties:
+            status:
+              const: mfa_setup_required
+            setupToken:
+              type: string
+    Me:
+      type: object
+      properties:
+        id:
+          type: string
+        email:
+          type: string
+        role:
+          type: string
+        mfaEnabled:
+          type: boolean
+        fullName:
+          type: string
+        phone:
+          type:
+            - string
+            - "null"
+    Doctor:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        fullName:
+          type: string
+        specialty:
+          type: string
+        yearsExperience:
+          type: integer
+        languages:
+          type: array
+          items:
+            type: string
+        bio:
+          type:
+            - string
+            - "null"
+        feeMinor:
+          type: integer
+        currency:
+          type: string
+        verificationStatus:
+          type: string
+          description: Only visible to the doctor and admins
+    Slot:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        startsAt:
+          type: string
+          format: date-time
+        endsAt:
+          type: string
+          format: date-time
+    Payment:
+      type: object
+      properties:
+        id:
+          type: string
+        consultationId:
+          type: string
+        status:
+          type: string
+          enum:
+            - pending
+            - succeeded
+            - failed
+            - refund_pending
+            - refunded
+        amountMinor:
+          type: integer
+        currency:
+          type: string
+        checkoutUrl:
+          type:
+            - string
+            - "null"
+          description: Appears shortly after booking, once the worker has created the PSP intent
+        failureReason:
+          type:
+            - string
+            - "null"
+    Consultation:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        status:
+          $ref: "#/components/schemas/ConsultationStatus"
+        slotId:
+          type: string
+        doctorId:
+          type: string
+        patientId:
+          type: string
+        scheduledStart:
+          type: string
+          format: date-time
+        scheduledEnd:
+          type: string
+          format: date-time
+        holdExpiresAt:
+          type:
+            - string
+            - "null"
+          format: date-time
+        startedAt:
+          type:
+            - string
+            - "null"
+        endedAt:
+          type:
+            - string
+            - "null"
+        cancelReason:
+          type:
+            - string
+            - "null"
+        reason:
+          type:
+            - string
+            - "null"
+          description: Decrypted symptoms; visible to the patient and doctor only
+        payment:
+          oneOf:
+            - type: "null"
+            - type: object
+              properties:
+                id:
+                  type: string
+                status:
+                  type: string
+                amountMinor:
+                  type: integer
+                currency:
+                  type: string
+                checkoutUrl:
+                  type:
+                    - string
+                    - "null"
+        createdAt:
+          type: string
+          format: date-time
+    PrescriptionRequest:
+      type: object
+      required:
+        - items
+      additionalProperties: false
+      properties:
+        items:
+          type: array
+          minItems: 1
+          maxItems: 30
+          items:
+            type: object
+            required:
+              - medicine
+              - dosage
+              - frequency
+              - durationDays
+            properties:
+              medicine:
+                type: string
+              dosage:
+                type: string
+              frequency:
+                type: string
+              durationDays:
+                type: integer
+                minimum: 1
+                maximum: 365
+              instructions:
+                type: string
+        notes:
+          type: string
+          maxLength: 5000
+    Prescription:
+      type: object
+      properties:
+        id:
+          type: string
+        consultationId:
+          type: string
+        doctorId:
+          type: string
+        patientId:
+          type: string
+        items:
+          type: array
+          items:
+            type: object
+        notes:
+          type:
+            - string
+            - "null"
+        createdAt:
+          type: string
+          format: date-time
+    AuditEntry:
+      type: object
+      properties:
+        id:
+          type: string
+        occurredAt:
+          type: string
+          format: date-time
+        actorId:
+          type:
+            - string
+            - "null"
+        actorRole:
+          type:
+            - string
+            - "null"
+        action:
+          type: string
+        entityType:
+          type: string
+        entityId:
+          type:
+            - string
+            - "null"
+        ip:
+          type:
+            - string
+            - "null"
+        requestId:
+          type:
+            - string
+            - "null"
+        metadata:
+          type: object
+        signatureValid:
+          type: boolean
+    AnalyticsSummary:
+      type: object
+      properties:
+        from:
+          type: string
+          format: date-time
+        to:
+          type: string
+          format: date-time
+        totals:
+          type: object
+          properties:
+            booked:
+              type: integer
+            completed:
+              type: integer
+            cancelled:
+              type: integer
+            revenueMinor:
+              type: integer
+        byDay:
+          type: array
+          items:
+            type: object
+            properties:
+              day:
+                type: string
+                format: date
+              specialty:
+                type: string
+              booked:
+                type: integer
+              completed:
+                type: integer
+              cancelled:
+                type: integer
+              revenueMinor:
+                type: integer

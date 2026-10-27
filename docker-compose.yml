@@ -1,0 +1,90 @@
+# Full local stack: API + worker + Postgres + Redis + Prometheus + Grafana + OTel collector + Jaeger.
+#   docker compose up --build
+# Secrets below are DEV-ONLY placeholders. Production injects real ones from a secret manager.
+x-app-env: &app-env
+  NODE_ENV: production
+  LOG_LEVEL: info
+  DATABASE_URL: postgres://amrutam:amrutam@postgres:5432/amrutam
+  REDIS_URL: redis://redis:6379
+  JWT_SECRET: dev-only-jwt-secret-dev-only-jwt-secret-0001
+  DATA_ENCRYPTION_KEYS: "1:ZGV2LW9ubHktZGF0YS1rZXktMzItYnl0ZXMtbG9uZyE="
+  AUDIT_HMAC_KEYS: "1:ZGV2LW9ubHktYXVkaXQta2V5LTMyLWJ5dGVzLWxvbiE="
+  PAYMENT_WEBHOOK_SECRET: dev-only-webhook-secret
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment: { POSTGRES_USER: amrutam, POSTGRES_PASSWORD: amrutam, POSTGRES_DB: amrutam }
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck: { test: ["CMD-SHELL", "pg_isready -U amrutam"], interval: 5s, timeout: 3s, retries: 10 }
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"] # cache + rate-limit counters only; safe to lose
+    healthcheck: { test: ["CMD", "redis-cli", "ping"], interval: 5s, timeout: 3s, retries: 10 }
+
+  migrate:
+    build: .
+    command: ["node", "dist/db/migrate-cli.js"]
+    environment: *app-env
+    depends_on: { postgres: { condition: service_healthy } }
+    restart: "no"
+
+  api:
+    build: .
+    environment:
+      <<: *app-env
+      OTEL_SERVICE_NAME: amrutam-api
+    ports: ["3000:3000"]
+    expose: ["9464"]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+
+  worker:
+    build: .
+    command: ["node", "dist/worker.js"]
+    environment:
+      <<: *app-env
+      OTEL_SERVICE_NAME: amrutam-worker
+    expose: ["9465"]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    volumes:
+      - ./deploy/observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/observability/alerts.yml:/etc/prometheus/alerts.yml:ro
+    ports: ["9090:9090"]
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    environment: { GF_AUTH_ANONYMOUS_ENABLED: "true", GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer }
+    volumes:
+      - ./deploy/observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports: ["3001:3000"]
+    depends_on: [prometheus]
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.108.0
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes: ["./deploy/observability/otel-collector.yaml:/etc/otelcol/config.yaml:ro"]
+    depends_on: [jaeger]
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.60
+    ports: ["16686:16686"]
+
+volumes:
+  pgdata:

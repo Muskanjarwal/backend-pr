@@ -1,0 +1,22 @@
+# Run once per release, BEFORE rolling the Deployments (CI/CD applies this and waits for completion).
+# Migrations are expand/contract: additive and backward compatible with the previous app version, so a failed
+# rollout can be rolled back without a schema rollback.
+apiVersion: batch/v1
+kind: Job
+metadata: { name: amrutam-migrate, namespace: amrutam }
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext: { runAsNonRoot: true, runAsUser: 1000, seccompProfile: { type: RuntimeDefault } }
+      containers:
+        - name: migrate
+          image: ghcr.io/amrutam/telemedicine-backend:latest
+          command: ["node", "dist/db/migrate-cli.js"]
+          envFrom:
+            - configMapRef: { name: amrutam-config }
+            - secretRef: { name: amrutam-secrets }
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } }

@@ -1,0 +1,84 @@
+# Alerts are written against the SLOs: 99.95% availability, p95 < 200ms reads / < 500ms writes.
+groups:
+  - name: amrutam-slo
+    rules:
+      - alert: ApiHighErrorRate
+        expr: |
+          sum(rate(http_request_duration_seconds_count{status=~"5.."}[5m]))
+            / sum(rate(http_request_duration_seconds_count[5m])) > 0.005
+        for: 5m
+        labels: { severity: page }
+        annotations:
+          summary: "5xx rate above 0.5% for 5m"
+          description: "Burns the 99.95% availability budget (0.05%) at 10x. Check /readyz, DB pool saturation, recent deploy."
+
+      - alert: ApiErrorBudgetFastBurn
+        expr: |
+          sum(rate(http_request_duration_seconds_count{status=~"5.."}[1h]))
+            / sum(rate(http_request_duration_seconds_count[1h])) > 0.0072
+        for: 2m
+        labels: { severity: page }
+        annotations:
+          summary: "Error budget burning at 14.4x (1h window)"
+
+      - alert: ReadLatencySLOBreach
+        expr: |
+          histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{method="GET"}[5m]))) > 0.2
+        for: 10m
+        labels: { severity: ticket }
+        annotations: { summary: "p95 read latency above 200ms for 10m" }
+
+      - alert: WriteLatencySLOBreach
+        expr: |
+          histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{method=~"POST|PATCH|DELETE"}[5m]))) > 0.5
+        for: 10m
+        labels: { severity: ticket }
+        annotations: { summary: "p95 write latency above 500ms for 10m" }
+
+  - name: amrutam-dependencies
+    rules:
+      - alert: DbPoolSaturated
+        expr: db_pool_connections{state="waiting"} > 0
+        for: 3m
+        labels: { severity: ticket }
+        annotations:
+          summary: "Requests are queuing for a DB connection"
+          description: "Scale API replicas only if PgBouncer/DB has headroom; otherwise look for slow queries."
+
+      - alert: JobsDeadLettered
+        expr: increase(jobs_processed_total{outcome="dead"}[15m]) > 0
+        labels: { severity: page }
+        annotations:
+          summary: "A background job exhausted its retries"
+          description: "Likely a stuck saga step (payment intent/refund). Inspect `SELECT * FROM jobs WHERE status='dead'`, fix cause, then requeue."
+
+      - alert: JobQueueBacklog
+        expr: job_queue_depth > 500
+        for: 10m
+        labels: { severity: ticket }
+        annotations: { summary: "Job queue depth above 500 for 10m — add worker replicas" }
+
+      - alert: WorkerDown
+        expr: absent(up{job="amrutam-worker"} == 1)
+        for: 3m
+        labels: { severity: page }
+        annotations: { summary: "No healthy worker; holds won't expire and payments won't progress" }
+
+  - name: amrutam-security
+    rules:
+      - alert: LoginFailureSpike
+        expr: sum(rate(auth_events_total{event=~"login_failed|login_locked"}[5m])) > 5
+        for: 5m
+        labels: { severity: ticket }
+        annotations: { summary: "Elevated failed logins — possible credential stuffing" }
+
+      - alert: RefreshTokenReuse
+        expr: increase(auth_events_total{event="refresh_reuse"}[10m]) > 0
+        labels: { severity: ticket }
+        annotations: { summary: "Refresh-token reuse detected (stolen token or client bug)" }
+
+      - alert: WebhookSignatureFailures
+        expr: sum(rate(http_request_duration_seconds_count{route="/v1/payments/webhook",status="401"}[10m])) > 0.1
+        for: 10m
+        labels: { severity: ticket }
+        annotations: { summary: "Sustained invalid payment-webhook signatures" }
