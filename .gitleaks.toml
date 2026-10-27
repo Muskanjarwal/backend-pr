@@ -1,0 +1,9 @@
+# Extends the default gitleaks ruleset; only the allowlist below is added.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Fixed, obviously-fake secrets used by the test suite (never real credentials)"
+paths = [
+  '''^tests/''',
+]
